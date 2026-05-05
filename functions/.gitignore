@@ -1,0 +1,9 @@
+# Python bytecode
+__pycache__/
+
+# Python virtual environment
+venv/
+*.local
+
+# API 보안 키 및 자격 증명 (업로드 방지)
+serviceAccountKey.json
