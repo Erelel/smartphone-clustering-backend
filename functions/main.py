@@ -1,98 +1,140 @@
 import json
 import os
-import numpy as np
+import threading
+from typing import Any
+
+from firebase_admin import credentials, firestore, initialize_app
 from firebase_functions import https_fn
-from firebase_admin import initialize_app, firestore, credentials
 
-# ----------------- 수정된 부분 시작 -----------------
-# 서비스 계정 키 파일 경로 설정
+from inference import infer_cluster
+
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
-cred_path = os.path.join(current_dir, 'serviceAccountKey.json')
+cred_path = os.path.join(current_dir, "serviceAccountKey.json")
 
-# 로컬에 키 파일이 존재하면 키를 사용하여 초기화 (로컬 테스트용)
 if os.path.exists(cred_path):
     cred = credentials.Certificate(cred_path)
     initialize_app(cred)
-# 키 파일이 없으면 기본 인증으로 초기화 (클라우드 배포용)
 else:
     initialize_app()
 
 db = firestore.client()
-# ----------------- 수정된 부분 끝 -----------------
-# 모델 파라미터 로드 함수
-def load_model_params():
-    # 현재 파일(main.py)과 같은 디렉토리의 json 파일 읽기
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    json_path = os.path.join(current_dir, 'model_params.json')
-    with open(json_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
-# 중심점과의 거리 계산 함수
-def calculate_distances(features, centroids):
-    # np.linalg.norm(a - b)를 사용하여 유클리디안 거리 연산
-    distances = [np.linalg.norm(np.array(features) - np.array(c)) for c in centroids]
-    cluster_id = int(np.argmin(distances))
-    min_distance = float(distances[cluster_id])
-    return cluster_id, min_distance
+SYSTEM_PARAMS_COLLECTION = "system_parameters"
+SYSTEM_PARAMS_DOC = "kmeans_v1"
 
-# 수동 MinMax 스케일링 함수
-def scale_features(focus, switch, params):
-    # (x - min) / (max - min) 공식 적용
-    scaled_focus = (focus - params['focus_min']) / (params['focus_max'] - params['focus_min'])
-    scaled_switch = (switch - params['switch_min']) / (params['switch_max'] - params['switch_min'])
-    return [scaled_focus, scaled_switch]
+_MODEL_PARAMS = None
+_MODEL_PARAMS_LOCK = threading.Lock()
+
+
+def _restore_centroids_from_firestore(centroids: Any) -> list[list[float]]:
+    if isinstance(centroids, dict):
+        ordered_items = sorted(centroids.items(), key=lambda item: int(item[0]))
+        return [[float(value) for value in row] for _, row in ordered_items]
+
+    if isinstance(centroids, list):
+        return [[float(value) for value in row] for row in centroids]
+
+    raise ValueError("Model params centroids are missing or invalid.")
+
+
+def _load_model_params_from_firestore() -> dict:
+    doc_ref = db.collection(SYSTEM_PARAMS_COLLECTION).document(SYSTEM_PARAMS_DOC)
+    snapshot = doc_ref.get()
+    if not snapshot.exists:
+        raise ValueError("Model params document not found: system_parameters/kmeans_v1")
+
+    params = snapshot.to_dict()
+    if not isinstance(params, dict):
+        raise ValueError("Model params document is empty or invalid.")
+
+    params["centroids"] = _restore_centroids_from_firestore(params.get("centroids"))
+    return params
+
+
+def get_model_params() -> dict:
+    global _MODEL_PARAMS
+    if _MODEL_PARAMS is None:
+        with _MODEL_PARAMS_LOCK:
+            if _MODEL_PARAMS is None:
+                _MODEL_PARAMS = _load_model_params_from_firestore()
+    return _MODEL_PARAMS
+
+
+def _parse_request(req: https_fn.Request) -> dict:
+    req_data = req.get_json(silent=True)
+    if not isinstance(req_data, dict):
+        raise ValueError("Invalid JSON payload.")
+
+    required_fields = [
+        "user_id",
+        "week_start",
+        "week_end",
+        "is_valid_data",
+        "foreground_app_duration_sum",
+        "foreground_app_switch_per_hour",
+        "concentration_ratio",
+    ]
+    missing = [
+        field
+        for field in required_fields
+        if field not in req_data or req_data[field] is None
+    ]
+    if missing:
+        raise ValueError(f"Missing required fields: {missing}")
+
+    return {
+        "user_id": req_data["user_id"],
+        "week_start": req_data["week_start"],
+        "week_end": req_data["week_end"],
+        "is_valid_data": req_data["is_valid_data"],
+        "foreground_app_duration_sum": req_data["foreground_app_duration_sum"],
+        "foreground_app_switch_per_hour": req_data["foreground_app_switch_per_hour"],
+        "concentration_ratio": req_data["concentration_ratio"],
+    }
+
 
 @https_fn.on_request()
 def predict_user_cluster(req: https_fn.Request) -> https_fn.Response:
-    """앱에서 호출하는 API 엔드포인트"""
     try:
-        # 1. 요청 데이터 파싱
-        req_data = req.get_json()
-        user_id = req_data.get('user_id')
-        duration_sum = req_data.get('foreground_app_duration_sum')
-        switch_per_hour = req_data.get('foreground_app_switch_per_hour')
-        concentration_ratio = req_data.get('concentration_ratio')
-        week_start = req_data.get('week_start')
-        
-        if not all([user_id, duration_sum, switch_per_hour, concentration_ratio]):
-            return https_fn.Response("Missing required fields", status=400)
+        payload = _parse_request(req)
+        params = get_model_params()
 
-        # 2. 파라미터 로드
-        params = load_model_params()
+        inference_result = infer_cluster(payload, params)
 
-        # 3. 파생 변수 연산 (preprocessing.py 로직 동일 적용)
-        # log1p 적용 여부 체크 후 연산
-        if params.get('log_transform_applied', False):
-            duration_sum = np.log1p(duration_sum)
-            switch_per_hour = np.log1p(switch_per_hour)
-            
-        focus_intensity = duration_sum * concentration_ratio
-        switch_frequency = switch_per_hour * (1 - concentration_ratio)
-
-        # 4. 스케일링 및 군집 판별
-        scaled_features = scale_features(focus_intensity, switch_frequency, params)
-        cluster_id, distance = calculate_distances(scaled_features, params['centroids'])
-
-        # 5. 결과 데이터 구성
-        result_data = {
-            "week_start": week_start,
-            "features": {
-                "focus_intensity": float(focus_intensity),
-                "switch_frequency": float(switch_frequency)
-            },
-            "clustering_result": {
-                "assigned_cluster_id": cluster_id,
-                "distance_to_centroid": distance
-            },
-            "created_at": firestore.SERVER_TIMESTAMP
+        doc_data = {
+            "user_id": payload["user_id"],
+            "week_start": inference_result["week_start"],
+            "week_end": inference_result["week_end"],
+            "is_valid_data": bool(inference_result["is_valid_data"]),
+            "focus_intensity": float(inference_result["features"]["focus_intensity"]),
+            "switch_frequency": float(
+                inference_result["features"]["switch_frequency"]
+            ),
+            "cluster_id": int(
+                inference_result["clustering_result"]["assigned_cluster_id"]
+            ),
+            "distance_to_centroid": float(
+                inference_result["clustering_result"]["distance_to_centroid"]
+            ),
+            "created_at": firestore.SERVER_TIMESTAMP,
         }
 
-        # 6. Firestore에 저장 (권장 스키마: users/{user_id}/weekly_clusters/{week_start})
-        doc_ref = db.collection('users').document(user_id).collection('weekly_clusters').document(week_start)
-        doc_ref.set(result_data)
+        doc_ref = (
+            db.collection("users")
+            .document(payload["user_id"])
+            .collection("weekly_clusters")
+            .document(payload["week_start"])
+        )
+        doc_ref.set(doc_data)
 
-        # 7. 클라이언트로 결과 반환
-        return https_fn.Response(json.dumps(result_data), status=200, mimetype="application/json")
-
-    except Exception as e:
-        return https_fn.Response(f"Error processing request: {str(e)}", status=500)
+        response_data = {k: v for k, v in doc_data.items() if k != "created_at"}
+        return https_fn.Response(
+            json.dumps(response_data, ensure_ascii=True),
+            status=200,
+            mimetype="application/json",
+        )
+    except ValueError as exc:
+        return https_fn.Response(str(exc), status=400)
+    except Exception as exc:
+        return https_fn.Response(f"Error processing request: {str(exc)}", status=500)
